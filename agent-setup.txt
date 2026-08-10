@@ -1,0 +1,139 @@
+COURSE GATEWAY SETUP — INSTRUCTIONS FOR CLAUDE CODE
+
+You are helping a student set up access to the course LLM gateway. The student may
+have never used a terminal. Do the work for them; do not hand them commands to run.
+Explain what you are doing in plain language as you go, in one short sentence per step.
+
+The student has given you an API key in their message. If they have not, ask for it
+and stop until they provide one.
+
+
+WHAT YOU ARE BUILDING
+
+A file that holds the student's key and defines a shell function called `claude-edu`,
+plus one line in their shell profile that loads it. After this, `claude-edu` starts
+Claude Code on the course gateway, while plain `claude` stays on their personal or
+class account.
+
+
+STEP 1 — DETECT THE SHELL
+
+Run: echo $SHELL
+
+If it contains "zsh":   profile is ~/.zshrc,  settings file is ~/.zshrc.local.portkey
+If it contains "bash":  profile is ~/.bashrc, settings file is ~/.bashrc.local.portkey
+
+On macOS with bash, use ~/.bash_profile instead of ~/.bashrc.
+Do not ask the student which shell they have. Detect it.
+
+
+STEP 2 — WRITE THE SETTINGS FILE
+
+Create the settings file (path from step 1) with exactly this content, substituting
+the student's key. Keep the comment lines — they matter later.
+
+    # Course LLM gateway. chmod 600, never commit, never share.
+    export PORTKEY_API_KEY=THE_STUDENTS_KEY
+    export PORTKEY_CONFIG=pc-1710-f-31a313
+
+    # Course Claude Code. Vars are scoped to THIS command only, so plain
+    # `claude` is unaffected and stays on the student's own account.
+    claude-edu() {
+      ANTHROPIC_BASE_URL=https://api.portkey.ai \
+      ANTHROPIC_AUTH_TOKEN=$PORTKEY_API_KEY \
+      ANTHROPIC_CUSTOM_HEADERS="x-portkey-config: $PORTKEY_CONFIG" \
+      claude "$@"
+    }
+
+Three things that are easy to get wrong. Do not "improve" any of them:
+
+  - `claude-edu` MUST be a shell function, not an alias. An alias does not expand
+    $PORTKEY_CONFIG correctly and the setup will fail in a way that is hard to see.
+  - Do NOT add `export ANTHROPIC_BASE_URL` or `export ANTHROPIC_AUTH_TOKEN` as global
+    exports anywhere. That would route the student's personal Claude Code usage
+    through the course budget. The variables belong inside the function only.
+  - Do not reformat the function onto one line or change the variable names.
+
+Then restrict permissions: chmod 600 on the settings file.
+
+
+STEP 3 — ADD THE LOADER LINE TO THE PROFILE
+
+Append to the profile file (~/.zshrc or ~/.bashrc or ~/.bash_profile):
+
+    [ -f ~/.zshrc.local.portkey ] && source ~/.zshrc.local.portkey
+
+using the settings-file path from step 1. Before appending, read the profile and check
+whether that line is already there. If it is, do not add a second copy.
+
+If the profile file does not exist, create it.
+
+
+STEP 4 — CHECK YOUR WORK
+
+Do these checks and report the result of each in one line:
+
+  1. The settings file exists and its permissions are 600.
+  2. The profile file contains exactly one loader line for it.
+  3. A fresh login shell picks up the settings. Run this and confirm it prints a
+     value starting with "pc-":
+
+         zsh -lic 'echo $PORTKEY_CONFIG'      # or: bash -lic 'echo $PORTKEY_CONFIG'
+
+     If it prints nothing, the loader line is in a file the shell does not read.
+     Say so plainly and fix it rather than declaring success.
+
+  4. The function is defined in a fresh shell:
+
+         zsh -lic 'type claude-edu'           # or: bash -lic 'type claude-edu'
+
+     It should report that claude-edu is a shell function.
+
+Do NOT make a real API call to test. It costs course budget and the student will
+verify in the next step anyway.
+
+Never print the student's key back to them, and never echo $PORTKEY_API_KEY.
+
+
+STEP 5 — TELL THEM WHAT TO DO NEXT
+
+Tell the student, in plain language:
+
+  - Setup is done, and which files you created or changed.
+  - They must CLOSE this terminal window completely and open a new one. The function
+    does not exist in the current window, because the window started before the
+    settings did. This is the step people skip.
+  - In the new window they should type:  claude-edu
+  - They should look for the words "API Usage Billing" in the startup banner. That
+    is how they know the course connection is working.
+
+Then stop. Do not run claude-edu yourself.
+
+
+IF SOMETHING GOES WRONG
+
+Permission denied writing the settings file — check the path is under the student's
+home directory, not a system location.
+
+The student's profile is managed by a framework (oh-my-zsh, etc.) — the loader line
+still works; append it at the end of the file.
+
+The student already has a settings file from a previous attempt — read it, and
+replace it rather than appending a second copy of the function.
+
+
+NOTES FOR YOU, NOT THE STUDENT
+
+Do not mention the following unless the student asks. They are here so you do not
+introduce these problems while "helping."
+
+  - The course config deliberately contains NO Portkey response-cache block. If you
+    ever create or edit a Portkey config, do not add "cache": {"mode": "simple"}. It
+    silently disables Anthropic prompt caching and multiplies cost per turn.
+  - The provider slug for this workspace is @gcp-vertex-global. Regional slugs such
+    as @gcp-vertex-us-east5 do not resolve here.
+  - Claude Code sends bare model names, so the x-portkey-config header is required.
+    A key with no config returns 400.
+  - If the student has MCP servers configured, their first turn or two in a session
+    will not use cached context, because the tool list changes while servers connect.
+    This is normal and is not something to fix during setup.
