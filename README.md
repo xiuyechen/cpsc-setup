@@ -1,8 +1,15 @@
 # cpsc-setup
 
-Setup instructions fetched by Claude Code during the course workshop.
+Workshop setup pages for using Claude Code on the course LLM gateway.
 
-- `agent-setup.txt` — instructions the setup agent reads. Students paste a single
-  line pointing Claude Code at this file, along with their own API key.
+- **`index.html`** — student-facing walkthrough.
+  Published at https://xiuyechen.github.io/cpsc-setup/
+- **`agent-setup.txt`** — instructions Claude Code fetches and follows to do the
+  setup. Students paste one line pointing at this file plus their own API key.
+  Served at https://xiuyechen.github.io/cpsc-setup/agent-setup.txt
 
-The key is never stored here. Each student supplies their own at setup time.
+No API keys are stored in this repo. Each student supplies their own at setup time.
+
+Note for maintainers: the Portkey config referenced in `agent-setup.txt` must not
+contain a `"cache": {"mode": "simple"}` block — it disables Anthropic prompt
+caching and multiplies per-turn cost.
