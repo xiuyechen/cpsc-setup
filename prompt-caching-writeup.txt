@@ -1,0 +1,201 @@
+PROMPT CACHING FAILS FOR CLAUDE CODE THROUGH THE PORTKEY GATEWAY
+A reproducible ~12x cost finding, and what it isn't
+
+Last updated: 2026-08-10
+Tested against: Claude Code v2.1.226, Portkey -> GCP Vertex AI, claude-sonnet-5
+
+
+SUMMARY
+
+Anthropic prompt caching works for ordinary API traffic through the Portkey gateway
+but fails for Claude Code's own traffic. Identical requests -- same config, same
+target, same upstream endpoint, byte-identical bodies -- cache when sent by curl and
+do not cache when sent by Claude Code.
+
+Measured cost for the same 58.4K-token request: 1.19 cents on a cache hit, 14.59
+cents on a miss. Roughly 12x, and the penalty grows as a session accumulates
+context, because the resent prefix grows with it.
+
+The cause was not identified. Everything observable from the client and from the
+gateway's own request logs is identical between a request that caches and one that
+does not. What follows is the evidence and, more usefully, the list of things that
+turned out not to be the cause.
+
+
+WHY THIS MATTERS MORE FOR AGENTIC TOOLS
+
+An LLM has no memory between calls, so a coding agent rebuilds its whole context
+every turn: system prompt, tool definitions, accumulated conversation. For Claude
+Code that is 50-75K tokens before you type anything.
+
+Anthropic prices cached input at roughly a tenth of fresh input, with a 25% premium
+on the initial write. The entire economics of agentic tooling rests on that
+discount. Write-then-never-read is the worst case: you pay the storage premium and
+never collect the savings, on every turn, forever.
+
+
+WHAT WORKS
+
+Raw curl through the gateway caches correctly. Three identical calls three seconds
+apart, cache_control: {"type": "ephemeral"} on a system block over the 1024-token
+minimum:
+
+    call 1:  cache_creation=58277  cache_read=0
+    call 2:  cache_creation=0      cache_read=58277
+    call 3:  cache_creation=0      cache_read=58277
+
+This includes a byte-for-byte replay of Claude Code's own captured request: all 49
+tool definitions, all three system blocks, identical cache_control breakpoints, plus
+its metadata, output_config and thinking fields and "stream": true. Replayed by
+curl, it caches. The payload is not the problem.
+
+
+WHAT FAILS
+
+Claude Code sending those same bytes through the same config:
+
+    call 1:  cache_creation=62505  cache_read=0
+    call 2:  cache_creation=62505  cache_read=0
+    call 3:  cache_creation=62599  cache_read=0
+    call 4:  cache_creation=62680  cache_read=0
+
+Intermittent rather than uniformly off: occasionally one call reads from cache, then
+later calls stop again with no change to the request.
+
+
+THE CONTROL
+
+Same Claude Code invocation, same machine, minutes apart, with only
+ANTHROPIC_BASE_URL / ANTHROPIC_AUTH_TOKEN / ANTHROPIC_CUSTOM_HEADERS unset so it
+goes direct to Anthropic:
+
+    call 1:  cache_creation=13677  cache_read=24535
+    call 2:  cache_creation=81     cache_read=38212
+    call 3:  cache_creation=81     cache_read=38293
+
+Direct: $0.116. Through the gateway: $0.491. Same work.
+
+
+RULED OUT (the useful part)
+
+  Request payload
+    Captured consecutive outbound bodies with a local proxy. Tools array and system
+    blocks are hash-identical across calls; only message history grows, which is
+    exactly what caching exists to handle.
+
+  cache_control breakpoints
+    Same count, same positions every call (2 system blocks + the last message).
+    Not a case of breakpoints drifting.
+
+  Client not sending directives
+    It sends them correctly. Verified on the wire.
+
+  Streaming
+    The replay caches with "stream": true and a full 58K prefix.
+
+  Model
+    Same behavior on sonnet and haiku targets.
+
+  Config header vs provider header
+    Both cache via curl.
+
+  Region
+    Cache-hit and cache-miss requests both resolve to locations/global, same
+    project, same model endpoint.
+
+  Target selection
+    Both resolve to config.targets[0].
+
+  MCP servers (partial)
+    Real but not the cause. While MCP servers connect, Claude Code sends a
+    placeholder tool (WaitForMcpServers) and then swaps in the real tools -- 44
+    tools becomes 49. Tool definitions precede the system prompt in the cached
+    prefix, so the swap invalidates it for the first turns. Worth avoiding. But
+    disabling MCP entirely does NOT fix the underlying problem: the cache still
+    fails, and can fail again after having briefly worked.
+
+
+A SEPARATE, SIMPLER BUG WORTH KNOWING
+
+Portkey configs accept a "cache" block that enables Portkey's own response cache.
+That is a different mechanism from Anthropic prompt caching, and enabling it
+prevents prompt caching from being read at all:
+
+    with "cache": {"mode": "simple"}     call 1  w=6419 r=0
+                                         call 2  w=6419 r=0
+                                         call 3  w=6419 r=0
+
+    with the block removed               call 1  w=6419 r=0
+                                         call 2  w=0    r=6419
+                                         call 3  w=0    r=6419
+
+If you are following a setup guide that includes that line -- several do -- remove
+it. This one is fully fixable on your side and is independent of everything above.
+
+
+REPRODUCING
+
+Build a payload whose system block exceeds 1024 tokens (below that, cache_control
+is silently ignored), then send it three times:
+
+    python3 - <<'EOF' > /tmp/probe.json
+    import json
+    line = ("segment the quick brown fox jumps over "
+            "the lazy dog near the riverbank at dawn. ")
+    print(json.dumps({
+      "model": "sonnet",
+      "max_tokens": 20,
+      "system": [{
+          "type": "text",
+          "text": line * 200,
+          "cache_control": {"type": "ephemeral"},
+      }],
+      "messages": [{"role": "user", "content": "Reply with exactly: OK"}],
+    }))
+    EOF
+
+    read_usage='
+    import json, sys
+    u = json.load(sys.stdin)["usage"]
+    print("write", u["cache_creation_input_tokens"],
+          "read",  u["cache_read_input_tokens"])
+    '
+
+    for i in 1 2 3; do
+      curl -s https://api.portkey.ai/v1/messages \
+        -H "Authorization: Bearer $PORTKEY_API_KEY" \
+        -H "anthropic-version: 2023-06-01" \
+        -H "content-type: application/json" \
+        -H "x-portkey-config: $PORTKEY_CONFIG" \
+        --data @/tmp/probe.json \
+      | python3 -c "$read_usage"
+      sleep 3
+    done
+
+Healthy: call 1 writes, calls 2 and 3 read. If call 2 writes again, caching is
+broken on that route.
+
+To compare a client against curl, capture the client's outbound request with a local
+proxy that logs the body and forwards upstream, then replay that exact body with
+curl. If the replay caches and the client does not, the payload is exonerated and
+the difference is in connection or session behavior.
+
+
+WHERE IT LANDS
+
+Every observable is identical between hit and miss. The remaining candidates sit
+inside the gateway runtime and are not visible from outside: gateway worker
+assignment, upstream connection pooling and reuse, or concurrent in-flight requests
+interacting with each other's cache writes. Claude Code holds a persistent streaming
+session and issues overlapping requests; curl opens a fresh connection per call.
+That is the leading hypothesis, untested, and stated as a hypothesis.
+
+Related but not identical: Portkey-AI/gateway#1579 reports cache_control blocks
+being stripped when routing Anthropic through Vertex. That fingerprint differs --
+there cache_creation is 0 because the directive is dropped; here creation succeeds
+and the read never lands.
+
+Practical position: raw API calls through the gateway cache correctly. Agentic
+clients like Claude Code currently do not. If you are choosing a gateway to put in
+front of coding agents at any scale, measure this before you commit -- it is a
+one-minute test and the cost difference compounds with every turn.
